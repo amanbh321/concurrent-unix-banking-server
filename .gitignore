@@ -1,0 +1,18 @@
+# Compiled Binaries
+server
+client
+tests/test_db
+
+# Object Files
+*.o
+*.a
+*.so
+
+# Data Directory (Ignore persistent database files, preserve directory structure)
+data/*.dat
+!data/.gitkeep
+
+# IDE and OS files
+.DS_Store
+*.swp
+*~
