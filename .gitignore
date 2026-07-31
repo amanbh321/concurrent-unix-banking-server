@@ -1,6 +1,6 @@
 # Compiled Binaries
 server
-client
+client_app
 tests/test_db
 
 # Object Files
