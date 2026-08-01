@@ -31,25 +31,29 @@ static ssize_t write_bytes(int fd, const void *buf, size_t count) {
     return total;
 }
 
+static const char* role_to_string(UserRole role) {
+    switch (role) {
+        case ROLE_CUSTOMER: return "Customer";
+        case ROLE_EMPLOYEE: return "Bank Employee";
+        case ROLE_MANAGER:  return "Manager";
+        case ROLE_ADMIN:    return "Administrator";
+        default:            return "Unknown";
+    }
+}
+
 int main(int argc, char *argv[]) {
     const char *server_ip = "127.0.0.1";
     int port = DEFAULT_PORT;
 
-    if (argc > 1) {
-        server_ip = argv[1];
-    }
-    if (argc > 2) {
-        port = atoi(argv[2]);
-    }
+    if (argc > 1) server_ip = argv[1];
+    if (argc > 2) port = atoi(argv[2]);
 
-    // 1. Create Socket
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd == -1) {
         perror("socket creation failed");
         return 1;
     }
 
-    // 2. Connect to Server
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -69,50 +73,114 @@ int main(int argc, char *argv[]) {
     }
     printf("Connected to server successfully!\n\n");
 
-    // Interactive CLI Loop
+    int is_logged_in = 0;
+    UserRecord current_user;
+    memset(&current_user, 0, sizeof(current_user));
+
     int choice;
     while (1) {
         printf("===========================================\n");
-        printf("       BANKING SYSTEM - CLIENT CLI\n");
+        printf("       BANKING MANAGEMENT SYSTEM CLI\n");
         printf("===========================================\n");
-        printf("1. Test Server Ping Connection\n");
-        printf("2. Exit\n");
-        printf("Enter choice (1-2): ");
-        if (scanf("%d", &choice) != 1) {
-            while (getchar() != '\n'); // clear buffer
-            continue;
-        }
 
-        if (choice == 1) {
-            RequestPacket req;
-            ResponsePacket res;
-            memset(&req, 0, sizeof(req));
-            req.opcode = 99; // Test ping opcode
-
-            if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) {
-                printf("Failed to send request to server.\n");
-                break;
+        if (!is_logged_in) {
+            printf("1. Login\n");
+            printf("2. Exit\n");
+            printf("Enter choice (1-2): ");
+            if (scanf("%d", &choice) != 1) {
+                while (getchar() != '\n');
+                continue;
             }
 
-            memset(&res, 0, sizeof(res));
-            if (read_bytes(sock_fd, &res, sizeof(res)) <= 0) {
-                printf("Server closed connection.\n");
+            if (choice == 1) {
+                RequestPacket req;
+                ResponsePacket res;
+                memset(&req, 0, sizeof(req));
+                req.opcode = OP_LOGIN;
+
+                printf("\n--- LOGIN ---\n");
+                printf("Enter Username: ");
+                scanf("%31s", req.payload.login.username);
+                printf("Enter Password: ");
+                scanf("%63s", req.payload.login.password);
+
+                if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) {
+                    printf("Server connection lost.\n");
+                    break;
+                }
+
+                memset(&res, 0, sizeof(res));
+                if (read_bytes(sock_fd, &res, sizeof(res)) <= 0) {
+                    printf("Server closed connection.\n");
+                    break;
+                }
+
+                printf("\n[Server Response] %s\n", res.message);
+                if (res.status_code == STATUS_SUCCESS) {
+                    is_logged_in = 1;
+                    current_user = res.payload.user;
+                    printf("Session active for User ID: %d | Role: %s\n", 
+                           current_user.user_id, role_to_string(current_user.role));
+                }
+                printf("\n");
+            } else if (choice == 2) {
+                RequestPacket req;
+                ResponsePacket res;
+                memset(&req, 0, sizeof(req));
+                req.opcode = OP_EXIT;
+                write_bytes(sock_fd, &req, sizeof(req));
+                read_bytes(sock_fd, &res, sizeof(res));
+                printf("Server: %s\nDisconnecting...\n", res.message);
                 break;
+            } else {
+                printf("Invalid choice. Try again.\n\n");
             }
-
-            printf("\n[Server Response] Status: %d, Message: %s\n\n", res.status_code, res.message);
-        } else if (choice == 2) {
-            RequestPacket req;
-            ResponsePacket res;
-            memset(&req, 0, sizeof(req));
-            req.opcode = OP_EXIT;
-
-            write_bytes(sock_fd, &req, sizeof(req));
-            read_bytes(sock_fd, &res, sizeof(res));
-            printf("Server: %s\nDisconnecting...\n", res.message);
-            break;
         } else {
-            printf("Invalid choice. Try again.\n\n");
+            printf("Logged in as: %s (ID: %d, Role: %s)\n", 
+                   current_user.full_name, current_user.user_id, role_to_string(current_user.role));
+            printf("-------------------------------------------\n");
+            printf("1. Logout\n");
+            printf("2. Exit\n");
+            printf("Enter choice (1-2): ");
+            if (scanf("%d", &choice) != 1) {
+                while (getchar() != '\n');
+                continue;
+            }
+
+            if (choice == 1) {
+                RequestPacket req;
+                ResponsePacket res;
+                memset(&req, 0, sizeof(req));
+                req.opcode = OP_LOGOUT;
+                req.user_id = current_user.user_id;
+                req.role = current_user.role;
+
+                if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) {
+                    printf("Server connection lost.\n");
+                    break;
+                }
+
+                memset(&res, 0, sizeof(res));
+                read_bytes(sock_fd, &res, sizeof(res));
+                printf("\n[Server Response] %s\n\n", res.message);
+
+                is_logged_in = 0;
+                memset(&current_user, 0, sizeof(current_user));
+            } else if (choice == 2) {
+                RequestPacket req;
+                ResponsePacket res;
+                memset(&req, 0, sizeof(req));
+                req.opcode = OP_EXIT;
+                req.user_id = current_user.user_id;
+                req.role = current_user.role;
+
+                write_bytes(sock_fd, &req, sizeof(req));
+                read_bytes(sock_fd, &res, sizeof(res));
+                printf("Server: %s\nDisconnecting...\n", res.message);
+                break;
+            } else {
+                printf("Invalid choice. Try again.\n\n");
+            }
         }
     }
 

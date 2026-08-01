@@ -1,6 +1,7 @@
 #include "common.h"
 #include "protocol.h"
 #include "db.h"
+#include "session.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,13 +15,12 @@
 
 static int server_fd = -1;
 
-// POSIX System Call helpers for complete socket reads and writes
 static ssize_t read_bytes(int fd, void *buf, size_t count) {
     size_t total = 0;
     char *ptr = (char *)buf;
     while (total < count) {
         ssize_t n = read(fd, ptr + total, count - total);
-        if (n <= 0) return n; // 0 = EOF, -1 = Error
+        if (n <= 0) return n;
         total += n;
     }
     return total;
@@ -37,7 +37,6 @@ static ssize_t write_bytes(int fd, const void *buf, size_t count) {
     return total;
 }
 
-// Signal handler for graceful shutdown
 static void handle_signal(int sig) {
     (void)sig;
     printf("\nShutting down banking server...\n");
@@ -47,39 +46,91 @@ static void handle_signal(int sig) {
     exit(0);
 }
 
-// Per-client thread handler
+// Opcode Handlers
+static void handle_login(int client_fd, const RequestPacket *req, ResponsePacket *res) {
+    UserRecord user;
+    if (db_find_user_by_username(req->payload.login.username, &user) != 0) {
+        res->status_code = STATUS_AUTH_FAILED;
+        strncpy(res->message, "Invalid username or password.", sizeof(res->message) - 1);
+        return;
+    }
+
+    if (strcmp(user.password, req->payload.login.password) != 0) {
+        res->status_code = STATUS_AUTH_FAILED;
+        strncpy(res->message, "Invalid username or password.", sizeof(res->message) - 1);
+        return;
+    }
+
+    if (user.is_active != 1) {
+        res->status_code = STATUS_ACCOUNT_INACTIVE;
+        strncpy(res->message, "Account is deactivated. Contact manager.", sizeof(res->message) - 1);
+        return;
+    }
+
+    int session_res = session_add(user.user_id, client_fd, user.role);
+    if (session_res == STATUS_ALREADY_LOGGED_IN) {
+        res->status_code = STATUS_ALREADY_LOGGED_IN;
+        strncpy(res->message, "User is already logged in from another active session.", sizeof(res->message) - 1);
+        return;
+    } else if (session_res != 0) {
+        res->status_code = STATUS_FAILURE;
+        strncpy(res->message, "Server session limit reached.", sizeof(res->message) - 1);
+        return;
+    }
+
+    res->status_code = STATUS_SUCCESS;
+    snprintf(res->message, sizeof(res->message), "Login successful. Welcome, %s!", user.full_name);
+    res->record_count = 1;
+    res->payload.user = user;
+}
+
+static void handle_logout(int client_fd, ResponsePacket *res) {
+    session_remove_by_fd(client_fd);
+    res->status_code = STATUS_SUCCESS;
+    strncpy(res->message, "Logged out successfully.", sizeof(res->message) - 1);
+}
+
 static void *handle_client(void *arg) {
     int client_fd = (int)(intptr_t)arg;
     RequestPacket req;
     ResponsePacket res;
 
-    printf("[Server Thread %lu] Handling client connection on FD %d\n", (unsigned long)pthread_self(), client_fd);
+    printf("[Server Thread %lu] Connection opened on FD %d\n", (unsigned long)pthread_self(), client_fd);
 
     while (1) {
         memset(&req, 0, sizeof(req));
         ssize_t n = read_bytes(client_fd, &req, sizeof(RequestPacket));
         if (n <= 0) {
-            printf("[Server Thread %lu] Client FD %d disconnected.\n", (unsigned long)pthread_self(), client_fd);
+            printf("[Server Thread %lu] Connection closed on FD %d\n", (unsigned long)pthread_self(), client_fd);
             break;
         }
 
-        if (req.opcode == OP_EXIT) {
-            printf("[Server Thread %lu] Client FD %d sent OP_EXIT.\n", (unsigned long)pthread_self(), client_fd);
-            memset(&res, 0, sizeof(res));
-            res.status_code = STATUS_SUCCESS;
-            strncpy(res.message, "Goodbye!", sizeof(res.message) - 1);
-            write_bytes(client_fd, &res, sizeof(ResponsePacket));
-            break;
-        }
-
-        // Opcode Dispatcher skeleton (Milestone 2 basic ping / status handling)
         memset(&res, 0, sizeof(res));
-        res.status_code = STATUS_SUCCESS;
-        snprintf(res.message, sizeof(res.message), "Server received opcode %d successfully", req.opcode);
+
+        switch (req.opcode) {
+            case OP_LOGIN:
+                handle_login(client_fd, &req, &res);
+                break;
+            case OP_LOGOUT:
+                handle_logout(client_fd, &res);
+                break;
+            case OP_EXIT:
+                session_remove_by_fd(client_fd);
+                res.status_code = STATUS_SUCCESS;
+                strncpy(res.message, "Goodbye!", sizeof(res.message) - 1);
+                write_bytes(client_fd, &res, sizeof(ResponsePacket));
+                goto cleanup;
+            default:
+                res.status_code = STATUS_SUCCESS;
+                snprintf(res.message, sizeof(res.message), "Server received opcode %d", req.opcode);
+                break;
+        }
 
         write_bytes(client_fd, &res, sizeof(ResponsePacket));
     }
 
+cleanup:
+    session_remove_by_fd(client_fd);
     close(client_fd);
     return NULL;
 }
@@ -90,24 +141,22 @@ int main(int argc, char *argv[]) {
         port = atoi(argv[1]);
     }
 
-    // Register signal handler
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    // Initialize database files
     if (db_init() != 0) {
         fprintf(stderr, "Failed to initialize storage engine.\n");
         return 1;
     }
 
-    // 1. Create TCP Socket
+    session_init();
+
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         perror("socket failed");
         return 1;
     }
 
-    // 2. Set SO_REUSEADDR option
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
         perror("setsockopt failed");
@@ -115,7 +164,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 3. Bind to Address and Port
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -128,7 +176,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 4. Listen for Incoming Connections
     if (listen(server_fd, 10) == -1) {
         perror("listen failed");
         close(server_fd);
@@ -139,7 +186,6 @@ int main(int argc, char *argv[]) {
     printf("   Banking System Server Listening on Port %d\n", port);
     printf("===========================================\n");
 
-    // 5. Accept Loop with pthread_create and pthread_detach
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
