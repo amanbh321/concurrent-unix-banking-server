@@ -2,6 +2,7 @@
 server
 client_app
 tests/test_db
+tests/test_session
 
 # Object Files
 *.o
