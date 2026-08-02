@@ -7,27 +7,39 @@
 #include <string.h>
 #include <time.h>
 
-void handle_customer_view_balance(int client_fd, const RequestPacket *req, ResponsePacket *res) {
-    (void)client_fd;
-    UserRecord user;
-    if (db_find_user_by_id(req->user_id, &user) != 0) {
+// Helper: lookup customer's account and validate it's active
+static int get_active_account(int user_id, AccountRecord *account, ResponsePacket *res) {
+    if (db_find_account_by_customer_id(user_id, account) != 0) {
         res->status_code = STATUS_NOT_FOUND;
-        strncpy(res->message, "User profile not found.", sizeof(res->message) - 1);
-        return;
+        strncpy(res->message, "No bank account found for this user.", sizeof(res->message) - 1);
+        return -1;
     }
-
-    AccountRecord account;
-    if (db_find_account_by_customer_id(user.user_id, &account) != 0) {
-        res->status_code = STATUS_NOT_FOUND;
-        strncpy(res->message, "No active bank account associated with this user.", sizeof(res->message) - 1);
-        return;
-    }
-
-    if (account.status != ACCOUNT_ACTIVE) {
+    if (account->status != ACCOUNT_ACTIVE) {
         res->status_code = STATUS_ACCOUNT_INACTIVE;
         strncpy(res->message, "Account is deactivated. Operations restricted.", sizeof(res->message) - 1);
-        return;
+        return -1;
     }
+    return 0;
+}
+
+// Helper: log a transaction record
+static void log_transaction(int src_acc, int dst_acc, TransactionType type, double amount, double balance_after) {
+    TransactionRecord txn;
+    memset(&txn, 0, sizeof(txn));
+    txn.transaction_id = db_get_next_transaction_id();
+    txn.source_account_id = src_acc;
+    txn.destination_account_id = dst_acc;
+    txn.type = type;
+    txn.amount = amount;
+    txn.balance_after = balance_after;
+    txn.timestamp = (long)time(NULL);
+    db_write_transaction(&txn);
+}
+
+void handle_customer_view_balance(int client_fd, const RequestPacket *req, ResponsePacket *res) {
+    (void)client_fd;
+    AccountRecord account;
+    if (get_active_account(req->user_id, &account, res) != 0) return;
 
     res->status_code = STATUS_SUCCESS;
     snprintf(res->message, sizeof(res->message), "Account Balance: $%.2f", account.balance);
@@ -44,48 +56,20 @@ void handle_customer_deposit(int client_fd, const RequestPacket *req, ResponsePa
         return;
     }
 
-    UserRecord user;
-    if (db_find_user_by_id(req->user_id, &user) != 0) {
-        res->status_code = STATUS_NOT_FOUND;
-        strncpy(res->message, "User profile not found.", sizeof(res->message) - 1);
-        return;
-    }
-
     AccountRecord account;
-    if (db_find_account_by_customer_id(user.user_id, &account) != 0) {
-        res->status_code = STATUS_NOT_FOUND;
-        strncpy(res->message, "No active bank account found for deposit.", sizeof(res->message) - 1);
-        return;
-    }
-
-    if (account.status != ACCOUNT_ACTIVE) {
-        res->status_code = STATUS_ACCOUNT_INACTIVE;
-        strncpy(res->message, "Account is deactivated.", sizeof(res->message) - 1);
-        return;
-    }
+    if (get_active_account(req->user_id, &account, res) != 0) return;
 
     account.balance += amount;
-
     if (db_update_account(&account) != 0) {
         res->status_code = STATUS_FAILURE;
-        strncpy(res->message, "Failed to update account balance in storage.", sizeof(res->message) - 1);
+        strncpy(res->message, "Failed to update account.", sizeof(res->message) - 1);
         return;
     }
 
-    // Log transaction
-    TransactionRecord txn;
-    memset(&txn, 0, sizeof(txn));
-    txn.transaction_id = db_get_next_transaction_id();
-    txn.source_account_id = 0;
-    txn.destination_account_id = account.account_id;
-    txn.type = TXN_DEPOSIT;
-    txn.amount = amount;
-    txn.balance_after = account.balance;
-    txn.timestamp = (long)time(NULL);
-    db_write_transaction(&txn);
+    log_transaction(0, account.account_id, TXN_DEPOSIT, amount, account.balance);
 
     res->status_code = STATUS_SUCCESS;
-    snprintf(res->message, sizeof(res->message), "Successfully deposited $%.2f. New Balance: $%.2f", amount, account.balance);
+    snprintf(res->message, sizeof(res->message), "Deposited $%.2f. New Balance: $%.2f", amount, account.balance);
     res->record_count = 1;
     res->payload.account = account;
 }
@@ -99,54 +83,26 @@ void handle_customer_withdraw(int client_fd, const RequestPacket *req, ResponseP
         return;
     }
 
-    UserRecord user;
-    if (db_find_user_by_id(req->user_id, &user) != 0) {
-        res->status_code = STATUS_NOT_FOUND;
-        strncpy(res->message, "User profile not found.", sizeof(res->message) - 1);
-        return;
-    }
-
     AccountRecord account;
-    if (db_find_account_by_customer_id(user.user_id, &account) != 0) {
-        res->status_code = STATUS_NOT_FOUND;
-        strncpy(res->message, "No active bank account found for withdrawal.", sizeof(res->message) - 1);
-        return;
-    }
-
-    if (account.status != ACCOUNT_ACTIVE) {
-        res->status_code = STATUS_ACCOUNT_INACTIVE;
-        strncpy(res->message, "Account is deactivated.", sizeof(res->message) - 1);
-        return;
-    }
+    if (get_active_account(req->user_id, &account, res) != 0) return;
 
     if (account.balance < amount) {
         res->status_code = STATUS_INSUFFICIENT_FUNDS;
-        snprintf(res->message, sizeof(res->message), "Insufficient funds. Current balance: $%.2f", account.balance);
+        snprintf(res->message, sizeof(res->message), "Insufficient funds. Balance: $%.2f", account.balance);
         return;
     }
 
     account.balance -= amount;
-
     if (db_update_account(&account) != 0) {
         res->status_code = STATUS_FAILURE;
-        strncpy(res->message, "Failed to update account balance in storage.", sizeof(res->message) - 1);
+        strncpy(res->message, "Failed to update account.", sizeof(res->message) - 1);
         return;
     }
 
-    // Log transaction
-    TransactionRecord txn;
-    memset(&txn, 0, sizeof(txn));
-    txn.transaction_id = db_get_next_transaction_id();
-    txn.source_account_id = account.account_id;
-    txn.destination_account_id = 0;
-    txn.type = TXN_WITHDRAWAL;
-    txn.amount = amount;
-    txn.balance_after = account.balance;
-    txn.timestamp = (long)time(NULL);
-    db_write_transaction(&txn);
+    log_transaction(account.account_id, 0, TXN_WITHDRAWAL, amount, account.balance);
 
     res->status_code = STATUS_SUCCESS;
-    snprintf(res->message, sizeof(res->message), "Successfully withdrew $%.2f. New Balance: $%.2f", amount, account.balance);
+    snprintf(res->message, sizeof(res->message), "Withdrew $%.2f. New Balance: $%.2f", amount, account.balance);
     res->record_count = 1;
     res->payload.account = account;
 }

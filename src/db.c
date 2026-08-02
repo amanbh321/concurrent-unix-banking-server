@@ -9,7 +9,8 @@
 #include <string.h>
 #include <stdio.h>
 
-// Lock helper using fcntl
+// --- fcntl record locking ---
+
 int db_lock_record(int fd, off_t offset, size_t size, int lock_type) {
     struct flock fl;
     memset(&fl, 0, sizeof(fl));
@@ -17,49 +18,147 @@ int db_lock_record(int fd, off_t offset, size_t size, int lock_type) {
     fl.l_start = offset;
     fl.l_len = size;
 
-    if (lock_type == LOCK_READ) {
-        fl.l_type = F_RDLCK;
-    } else if (lock_type == LOCK_WRITE) {
-        fl.l_type = F_WRLCK;
-    } else if (lock_type == LOCK_UNLOCK) {
-        fl.l_type = F_UNLCK;
-    } else {
-        return -1;
-    }
+    if (lock_type == LOCK_READ)        fl.l_type = F_RDLCK;
+    else if (lock_type == LOCK_WRITE)  fl.l_type = F_WRLCK;
+    else if (lock_type == LOCK_UNLOCK) fl.l_type = F_UNLCK;
+    else return -1;
 
     return fcntl(fd, F_SETLKW, &fl);
 }
 
-// Database initialization & file bootstrapping
-int db_init(void) {
-    // Create data directory if missing
-    struct stat st;
-    if (stat(DATA_DIR, &st) == -1) {
-        if (mkdir(DATA_DIR, 0755) == -1) {
-            return -1;
-        }
-    }
+// --- Generic record operations (used by all entity functions below) ---
 
-    // 1. Initialize metadata.dat if absent
+// Append a record to end of file with write lock + fsync
+static int append_record(const char *filepath, const void *record, size_t rec_size) {
+    int fd = open(filepath, O_WRONLY | O_APPEND);
+    if (fd == -1) return -1;
+
+    off_t offset = lseek(fd, 0, SEEK_END);
+    db_lock_record(fd, offset, rec_size, LOCK_WRITE);
+    ssize_t n = write(fd, record, rec_size);
+    fsync(fd);
+    db_lock_record(fd, offset, rec_size, LOCK_UNLOCK);
+    close(fd);
+    return (n == (ssize_t)rec_size) ? 0 : -1;
+}
+
+// Find first record where the int at key_offset matches key_val
+static int find_by_int(const char *filepath, size_t rec_size, size_t key_offset, int key_val, void *out) {
+    int fd = open(filepath, O_RDONLY);
+    if (fd == -1) return -1;
+
+    char buf[rec_size];
+    off_t offset = 0;
+    while (1) {
+        db_lock_record(fd, offset, rec_size, LOCK_READ);
+        ssize_t n = read(fd, buf, rec_size);
+        db_lock_record(fd, offset, rec_size, LOCK_UNLOCK);
+        if (n != (ssize_t)rec_size) break;
+
+        if (*(int *)(buf + key_offset) == key_val) {
+            memcpy(out, buf, rec_size);
+            close(fd);
+            return 0;
+        }
+        offset += rec_size;
+    }
+    close(fd);
+    return -1;
+}
+
+// Find first record where the string at str_offset matches str_val
+static int find_by_str(const char *filepath, size_t rec_size, size_t str_offset, const char *str_val, void *out) {
+    int fd = open(filepath, O_RDONLY);
+    if (fd == -1) return -1;
+
+    char buf[rec_size];
+    off_t offset = 0;
+    while (1) {
+        db_lock_record(fd, offset, rec_size, LOCK_READ);
+        ssize_t n = read(fd, buf, rec_size);
+        db_lock_record(fd, offset, rec_size, LOCK_UNLOCK);
+        if (n != (ssize_t)rec_size) break;
+
+        if (strcmp((char *)(buf + str_offset), str_val) == 0) {
+            memcpy(out, buf, rec_size);
+            close(fd);
+            return 0;
+        }
+        offset += rec_size;
+    }
+    close(fd);
+    return -1;
+}
+
+// Update in-place: find record by int key, overwrite with new data
+static int update_by_int(const char *filepath, size_t rec_size, size_t key_offset, int key_val, const void *record) {
+    int fd = open(filepath, O_RDWR);
+    if (fd == -1) return -1;
+
+    char buf[rec_size];
+    off_t offset = 0;
+    while (read(fd, buf, rec_size) == (ssize_t)rec_size) {
+        if (*(int *)(buf + key_offset) == key_val) {
+            db_lock_record(fd, offset, rec_size, LOCK_WRITE);
+            lseek(fd, offset, SEEK_SET);
+            ssize_t n = write(fd, record, rec_size);
+            fsync(fd);
+            db_lock_record(fd, offset, rec_size, LOCK_UNLOCK);
+            close(fd);
+            return (n == (ssize_t)rec_size) ? 0 : -1;
+        }
+        offset += rec_size;
+    }
+    close(fd);
+    return -1;
+}
+
+// Scan and collect records where int at field_offset matches field_val
+static int scan_by_int(const char *filepath, size_t rec_size, size_t field_offset, int field_val, void *out_array, int max_count, int *out_count) {
+    int fd = open(filepath, O_RDONLY);
+    if (fd == -1) return -1;
+
+    char buf[rec_size];
+    off_t offset = 0;
+    int count = 0;
+    while (count < max_count) {
+        db_lock_record(fd, offset, rec_size, LOCK_READ);
+        ssize_t n = read(fd, buf, rec_size);
+        db_lock_record(fd, offset, rec_size, LOCK_UNLOCK);
+        if (n != (ssize_t)rec_size) break;
+
+        if (*(int *)(buf + field_offset) == field_val) {
+            memcpy((char *)out_array + count * rec_size, buf, rec_size);
+            count++;
+        }
+        offset += rec_size;
+    }
+    close(fd);
+    *out_count = count;
+    return 0;
+}
+
+// --- Database initialization ---
+
+int db_init(void) {
+    struct stat st;
+    if (stat(DATA_DIR, &st) == -1)
+        if (mkdir(DATA_DIR, 0755) == -1) return -1;
+
+    // Bootstrap metadata.dat
     if (stat(METADATA_FILE, &st) == -1) {
         int fd = open(METADATA_FILE, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd != -1) {
-            MetadataRecord meta;
-            meta.next_user_id = 1001;
-            meta.next_account_id = 5001;
-            meta.next_transaction_id = 1;
-            meta.next_loan_id = 1;
-            meta.next_feedback_id = 1;
-
-            db_lock_record(fd, 0, sizeof(MetadataRecord), LOCK_WRITE);
-            write(fd, &meta, sizeof(MetadataRecord));
+            MetadataRecord meta = { 1001, 5001, 1, 1, 1 };
+            db_lock_record(fd, 0, sizeof(meta), LOCK_WRITE);
+            write(fd, &meta, sizeof(meta));
             fsync(fd);
-            db_lock_record(fd, 0, sizeof(MetadataRecord), LOCK_UNLOCK);
+            db_lock_record(fd, 0, sizeof(meta), LOCK_UNLOCK);
             close(fd);
         }
     }
 
-    // 2. Initialize users.dat and bootstrap Admin (ID 1000) if absent
+    // Bootstrap admin user
     if (stat(USERS_FILE, &st) == -1) {
         int fd = open(USERS_FILE, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd != -1) {
@@ -69,8 +168,6 @@ int db_init(void) {
             strncpy(admin.username, "admin", sizeof(admin.username) - 1);
             strncpy(admin.password, "admin123", sizeof(admin.password) - 1);
             admin.role = ROLE_ADMIN;
-            admin.account_id = 0;
-            admin.age = 35;
             admin.is_active = 1;
             strncpy(admin.full_name, "System Administrator", sizeof(admin.full_name) - 1);
             strncpy(admin.gender, "N/A", sizeof(admin.gender) - 1);
@@ -78,597 +175,124 @@ int db_init(void) {
             strncpy(admin.email, "admin@bank.com", sizeof(admin.email) - 1);
             strncpy(admin.address, "Headquarters", sizeof(admin.address) - 1);
 
-            db_lock_record(fd, 0, sizeof(UserRecord), LOCK_WRITE);
-            write(fd, &admin, sizeof(UserRecord));
+            write(fd, &admin, sizeof(admin));
             fsync(fd);
-            db_lock_record(fd, 0, sizeof(UserRecord), LOCK_UNLOCK);
             close(fd);
         }
     }
 
-    // 3. Ensure remaining data files exist
+    // Create remaining data files if missing
     const char *files[] = { ACCOUNTS_FILE, TRANSACTIONS_FILE, LOANS_FILE, FEEDBACK_FILE };
     for (int i = 0; i < 4; i++) {
         if (stat(files[i], &st) == -1) {
             int fd = open(files[i], O_WRONLY | O_CREAT | O_EXCL, 0644);
-            if (fd != -1) {
-                close(fd);
-            }
+            if (fd != -1) close(fd);
         }
     }
-
     return 0;
 }
 
-// Atomic ID allocation primitive
+// --- Atomic ID generation ---
+
 static int get_next_id_field(size_t field_offset) {
     int fd = open(METADATA_FILE, O_RDWR);
     if (fd == -1) return -1;
 
-    if (db_lock_record(fd, 0, sizeof(MetadataRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
+    db_lock_record(fd, 0, sizeof(MetadataRecord), LOCK_WRITE);
     MetadataRecord meta;
-    if (read(fd, &meta, sizeof(MetadataRecord)) != sizeof(MetadataRecord)) {
-        db_lock_record(fd, 0, sizeof(MetadataRecord), LOCK_UNLOCK);
+    if (read(fd, &meta, sizeof(meta)) != sizeof(meta)) {
+        db_lock_record(fd, 0, sizeof(meta), LOCK_UNLOCK);
         close(fd);
         return -1;
     }
 
     int *ptr = (int *)((char *)&meta + field_offset);
-    int new_id = *ptr;
-    (*ptr)++;
+    int new_id = (*ptr)++;
 
     lseek(fd, 0, SEEK_SET);
-    write(fd, &meta, sizeof(MetadataRecord));
+    write(fd, &meta, sizeof(meta));
     fsync(fd);
-
-    db_lock_record(fd, 0, sizeof(MetadataRecord), LOCK_UNLOCK);
+    db_lock_record(fd, 0, sizeof(meta), LOCK_UNLOCK);
     close(fd);
-
     return new_id;
 }
 
-int db_get_next_user_id(void) {
-    return get_next_id_field(offsetof(MetadataRecord, next_user_id));
-}
+int db_get_next_user_id(void)        { return get_next_id_field(offsetof(MetadataRecord, next_user_id)); }
+int db_get_next_account_id(void)     { return get_next_id_field(offsetof(MetadataRecord, next_account_id)); }
+int db_get_next_transaction_id(void) { return get_next_id_field(offsetof(MetadataRecord, next_transaction_id)); }
+int db_get_next_loan_id(void)        { return get_next_id_field(offsetof(MetadataRecord, next_loan_id)); }
+int db_get_next_feedback_id(void)    { return get_next_id_field(offsetof(MetadataRecord, next_feedback_id)); }
 
-int db_get_next_account_id(void) {
-    return get_next_id_field(offsetof(MetadataRecord, next_account_id));
-}
+// --- User CRUD (thin wrappers over generic functions) ---
 
-int db_get_next_transaction_id(void) {
-    return get_next_id_field(offsetof(MetadataRecord, next_transaction_id));
-}
+int db_write_user(const UserRecord *u)                     { return append_record(USERS_FILE, u, sizeof(UserRecord)); }
+int db_update_user(const UserRecord *u)                    { return update_by_int(USERS_FILE, sizeof(UserRecord), offsetof(UserRecord, user_id), u->user_id, u); }
+int db_find_user_by_id(int id, UserRecord *out)            { return find_by_int(USERS_FILE, sizeof(UserRecord), offsetof(UserRecord, user_id), id, out); }
+int db_find_user_by_username(const char *name, UserRecord *out) { return find_by_str(USERS_FILE, sizeof(UserRecord), offsetof(UserRecord, username), name, out); }
 
-int db_get_next_loan_id(void) {
-    return get_next_id_field(offsetof(MetadataRecord, next_loan_id));
-}
+// --- Account CRUD ---
 
-int db_get_next_feedback_id(void) {
-    return get_next_id_field(offsetof(MetadataRecord, next_feedback_id));
-}
+int db_write_account(const AccountRecord *a)                         { return append_record(ACCOUNTS_FILE, a, sizeof(AccountRecord)); }
+int db_update_account(const AccountRecord *a)                        { return update_by_int(ACCOUNTS_FILE, sizeof(AccountRecord), offsetof(AccountRecord, account_id), a->account_id, a); }
+int db_find_account_id(int id, AccountRecord *out)                   { return find_by_int(ACCOUNTS_FILE, sizeof(AccountRecord), offsetof(AccountRecord, account_id), id, out); }
+int db_find_account_by_customer_id(int cid, AccountRecord *out)      { return find_by_int(ACCOUNTS_FILE, sizeof(AccountRecord), offsetof(AccountRecord, customer_id), cid, out); }
 
-// --- USER OPERATIONS ---
+// --- Transaction operations ---
 
-int db_write_user(const UserRecord *user) {
-    int fd = open(USERS_FILE, O_WRONLY | O_APPEND);
-    if (fd == -1) return -1;
-
-    off_t offset = lseek(fd, 0, SEEK_END);
-    if (db_lock_record(fd, offset, sizeof(UserRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    ssize_t bytes = write(fd, user, sizeof(UserRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(UserRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(UserRecord)) ? 0 : -1;
-}
-
-int db_update_user(const UserRecord *user) {
-    int fd = open(USERS_FILE, O_RDWR);
-    if (fd == -1) return -1;
-
-    UserRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (read(fd, &current, sizeof(UserRecord)) == sizeof(UserRecord)) {
-        if (current.user_id == user->user_id) {
-            found = 1;
-            break;
-        }
-        offset += sizeof(UserRecord);
-    }
-
-    if (!found) {
-        close(fd);
-        return -1;
-    }
-
-    if (db_lock_record(fd, offset, sizeof(UserRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    lseek(fd, offset, SEEK_SET);
-    ssize_t bytes = write(fd, user, sizeof(UserRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(UserRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(UserRecord)) ? 0 : -1;
-}
-
-int db_find_user_by_id(int user_id, UserRecord *out_user) {
-    int fd = open(USERS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    UserRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (1) {
-        if (db_lock_record(fd, offset, sizeof(UserRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(UserRecord));
-        db_lock_record(fd, offset, sizeof(UserRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(UserRecord)) break;
-
-        if (current.user_id == user_id) {
-            *out_user = current;
-            found = 1;
-            break;
-        }
-        offset += sizeof(UserRecord);
-    }
-
-    close(fd);
-    return found ? 0 : -1;
-}
-
-int db_find_user_by_username(const char *username, UserRecord *out_user) {
-    int fd = open(USERS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    UserRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (1) {
-        if (db_lock_record(fd, offset, sizeof(UserRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(UserRecord));
-        db_lock_record(fd, offset, sizeof(UserRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(UserRecord)) break;
-
-        if (strcmp(current.username, username) == 0) {
-            *out_user = current;
-            found = 1;
-            break;
-        }
-        offset += sizeof(UserRecord);
-    }
-
-    close(fd);
-    return found ? 0 : -1;
-}
-
-// --- ACCOUNT OPERATIONS ---
-
-int db_write_account(const AccountRecord *account) {
-    int fd = open(ACCOUNTS_FILE, O_WRONLY | O_APPEND);
-    if (fd == -1) return -1;
-
-    off_t offset = lseek(fd, 0, SEEK_END);
-    if (db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    ssize_t bytes = write(fd, account, sizeof(AccountRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(AccountRecord)) ? 0 : -1;
-}
-
-int db_update_account(const AccountRecord *account) {
-    int fd = open(ACCOUNTS_FILE, O_RDWR);
-    if (fd == -1) return -1;
-
-    AccountRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (read(fd, &current, sizeof(AccountRecord)) == sizeof(AccountRecord)) {
-        if (current.account_id == account->account_id) {
-            found = 1;
-            break;
-        }
-        offset += sizeof(AccountRecord);
-    }
-
-    if (!found) {
-        close(fd);
-        return -1;
-    }
-
-    if (db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    lseek(fd, offset, SEEK_SET);
-    ssize_t bytes = write(fd, account, sizeof(AccountRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(AccountRecord)) ? 0 : -1;
-}
-
-int db_find_account_id(int account_id, AccountRecord *out_account) {
-    int fd = open(ACCOUNTS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    AccountRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (1) {
-        if (db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(AccountRecord));
-        db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(AccountRecord)) break;
-
-        if (current.account_id == account_id) {
-            *out_account = current;
-            found = 1;
-            break;
-        }
-        offset += sizeof(AccountRecord);
-    }
-
-    close(fd);
-    return found ? 0 : -1;
-}
-
-int db_find_account_by_customer_id(int customer_id, AccountRecord *out_account) {
-    int fd = open(ACCOUNTS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    AccountRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (1) {
-        if (db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(AccountRecord));
-        db_lock_record(fd, offset, sizeof(AccountRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(AccountRecord)) break;
-
-        if (current.customer_id == customer_id) {
-            *out_account = current;
-            found = 1;
-            break;
-        }
-        offset += sizeof(AccountRecord);
-    }
-
-    close(fd);
-    return found ? 0 : -1;
-}
-
-// --- TRANSACTION OPERATIONS ---
-
-int db_write_transaction(const TransactionRecord *txn) {
-    int fd = open(TRANSACTIONS_FILE, O_WRONLY | O_APPEND);
-    if (fd == -1) return -1;
-
-    off_t offset = lseek(fd, 0, SEEK_END);
-    if (db_lock_record(fd, offset, sizeof(TransactionRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    ssize_t bytes = write(fd, txn, sizeof(TransactionRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(TransactionRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(TransactionRecord)) ? 0 : -1;
-}
+int db_write_transaction(const TransactionRecord *t) { return append_record(TRANSACTIONS_FILE, t, sizeof(TransactionRecord)); }
 
 int db_get_transactions_by_account_id(int account_id, TransactionRecord *out_txns, int max_count, int *out_count) {
     int fd = open(TRANSACTIONS_FILE, O_RDONLY);
     if (fd == -1) return -1;
 
-    TransactionRecord current;
+    TransactionRecord t;
     off_t offset = 0;
     int count = 0;
-
     while (count < max_count) {
-        if (db_lock_record(fd, offset, sizeof(TransactionRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(TransactionRecord));
-        db_lock_record(fd, offset, sizeof(TransactionRecord), LOCK_UNLOCK);
+        db_lock_record(fd, offset, sizeof(t), LOCK_READ);
+        ssize_t n = read(fd, &t, sizeof(t));
+        db_lock_record(fd, offset, sizeof(t), LOCK_UNLOCK);
+        if (n != sizeof(t)) break;
 
-        if (bytes != sizeof(TransactionRecord)) break;
-
-        if (current.source_account_id == account_id || current.destination_account_id == account_id) {
-            out_txns[count++] = current;
-        }
-        offset += sizeof(TransactionRecord);
+        if (t.source_account_id == account_id || t.destination_account_id == account_id)
+            out_txns[count++] = t;
+        offset += sizeof(t);
     }
-
     close(fd);
     *out_count = count;
     return 0;
 }
 
-// --- LOAN OPERATIONS ---
+// --- Loan CRUD ---
 
-int db_write_loan(const LoanRecord *loan) {
-    int fd = open(LOANS_FILE, O_WRONLY | O_APPEND);
-    if (fd == -1) return -1;
+int db_write_loan(const LoanRecord *l)     { return append_record(LOANS_FILE, l, sizeof(LoanRecord)); }
+int db_update_loan(const LoanRecord *l)    { return update_by_int(LOANS_FILE, sizeof(LoanRecord), offsetof(LoanRecord, loan_id), l->loan_id, l); }
+int db_find_loan_by_id(int id, LoanRecord *out) { return find_by_int(LOANS_FILE, sizeof(LoanRecord), offsetof(LoanRecord, loan_id), id, out); }
 
-    off_t offset = lseek(fd, 0, SEEK_END);
-    if (db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
+int db_get_loans_by_customer_id(int cid, LoanRecord *out, int max, int *cnt)       { return scan_by_int(LOANS_FILE, sizeof(LoanRecord), offsetof(LoanRecord, customer_id), cid, out, max, cnt); }
+int db_get_loans_by_assigned_employee(int eid, LoanRecord *out, int max, int *cnt)  { return scan_by_int(LOANS_FILE, sizeof(LoanRecord), offsetof(LoanRecord, assigned_employee_id), eid, out, max, cnt); }
+int db_get_all_pending_loans(LoanRecord *out, int max, int *cnt)                    { return scan_by_int(LOANS_FILE, sizeof(LoanRecord), offsetof(LoanRecord, status), LOAN_PENDING, out, max, cnt); }
 
-    ssize_t bytes = write(fd, loan, sizeof(LoanRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_UNLOCK);
-    close(fd);
+// --- Feedback CRUD ---
 
-    return (bytes == sizeof(LoanRecord)) ? 0 : -1;
-}
+int db_write_feedback(const FeedbackRecord *f)  { return append_record(FEEDBACK_FILE, f, sizeof(FeedbackRecord)); }
+int db_update_feedback(const FeedbackRecord *f) { return update_by_int(FEEDBACK_FILE, sizeof(FeedbackRecord), offsetof(FeedbackRecord, feedback_id), f->feedback_id, f); }
 
-int db_update_loan(const LoanRecord *loan) {
-    int fd = open(LOANS_FILE, O_RDWR);
-    if (fd == -1) return -1;
-
-    LoanRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (read(fd, &current, sizeof(LoanRecord)) == sizeof(LoanRecord)) {
-        if (current.loan_id == loan->loan_id) {
-            found = 1;
-            break;
-        }
-        offset += sizeof(LoanRecord);
-    }
-
-    if (!found) {
-        close(fd);
-        return -1;
-    }
-
-    if (db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    lseek(fd, offset, SEEK_SET);
-    ssize_t bytes = write(fd, loan, sizeof(LoanRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(LoanRecord)) ? 0 : -1;
-}
-
-int db_find_loan_by_id(int loan_id, LoanRecord *out_loan) {
-    int fd = open(LOANS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    LoanRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (1) {
-        if (db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(LoanRecord));
-        db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(LoanRecord)) break;
-
-        if (current.loan_id == loan_id) {
-            *out_loan = current;
-            found = 1;
-            break;
-        }
-        offset += sizeof(LoanRecord);
-    }
-
-    close(fd);
-    return found ? 0 : -1;
-}
-
-int db_get_loans_by_customer_id(int customer_id, LoanRecord *out_loans, int max_count, int *out_count) {
-    int fd = open(LOANS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    LoanRecord current;
-    off_t offset = 0;
-    int count = 0;
-
-    while (count < max_count) {
-        if (db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(LoanRecord));
-        db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(LoanRecord)) break;
-
-        if (current.customer_id == customer_id) {
-            out_loans[count++] = current;
-        }
-        offset += sizeof(LoanRecord);
-    }
-
-    close(fd);
-    *out_count = count;
-    return 0;
-}
-
-int db_get_loans_by_assigned_employee(int employee_id, LoanRecord *out_loans, int max_count, int *out_count) {
-    int fd = open(LOANS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    LoanRecord current;
-    off_t offset = 0;
-    int count = 0;
-
-    while (count < max_count) {
-        if (db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(LoanRecord));
-        db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(LoanRecord)) break;
-
-        if (current.assigned_employee_id == employee_id) {
-            out_loans[count++] = current;
-        }
-        offset += sizeof(LoanRecord);
-    }
-
-    close(fd);
-    *out_count = count;
-    return 0;
-}
-
-int db_get_all_pending_loans(LoanRecord *out_loans, int max_count, int *out_count) {
-    int fd = open(LOANS_FILE, O_RDONLY);
-    if (fd == -1) return -1;
-
-    LoanRecord current;
-    off_t offset = 0;
-    int count = 0;
-
-    while (count < max_count) {
-        if (db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(LoanRecord));
-        db_lock_record(fd, offset, sizeof(LoanRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(LoanRecord)) break;
-
-        if (current.status == LOAN_PENDING) {
-            out_loans[count++] = current;
-        }
-        offset += sizeof(LoanRecord);
-    }
-
-    close(fd);
-    *out_count = count;
-    return 0;
-}
-
-// --- FEEDBACK OPERATIONS ---
-
-int db_write_feedback(const FeedbackRecord *fb) {
-    int fd = open(FEEDBACK_FILE, O_WRONLY | O_APPEND);
-    if (fd == -1) return -1;
-
-    off_t offset = lseek(fd, 0, SEEK_END);
-    if (db_lock_record(fd, offset, sizeof(FeedbackRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    ssize_t bytes = write(fd, fb, sizeof(FeedbackRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(FeedbackRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(FeedbackRecord)) ? 0 : -1;
-}
-
-int db_update_feedback(const FeedbackRecord *fb) {
-    int fd = open(FEEDBACK_FILE, O_RDWR);
-    if (fd == -1) return -1;
-
-    FeedbackRecord current;
-    off_t offset = 0;
-    int found = 0;
-
-    while (read(fd, &current, sizeof(FeedbackRecord)) == sizeof(FeedbackRecord)) {
-        if (current.feedback_id == fb->feedback_id) {
-            found = 1;
-            break;
-        }
-        offset += sizeof(FeedbackRecord);
-    }
-
-    if (!found) {
-        close(fd);
-        return -1;
-    }
-
-    if (db_lock_record(fd, offset, sizeof(FeedbackRecord), LOCK_WRITE) == -1) {
-        close(fd);
-        return -1;
-    }
-
-    lseek(fd, offset, SEEK_SET);
-    ssize_t bytes = write(fd, fb, sizeof(FeedbackRecord));
-    fsync(fd);
-    db_lock_record(fd, offset, sizeof(FeedbackRecord), LOCK_UNLOCK);
-    close(fd);
-
-    return (bytes == sizeof(FeedbackRecord)) ? 0 : -1;
-}
-
-int db_get_all_feedback(FeedbackRecord *out_feedbacks, int max_count, int *out_count) {
+int db_get_all_feedback(FeedbackRecord *out_fbs, int max_count, int *out_count) {
     int fd = open(FEEDBACK_FILE, O_RDONLY);
     if (fd == -1) return -1;
 
-    FeedbackRecord current;
+    FeedbackRecord f;
     off_t offset = 0;
     int count = 0;
-
     while (count < max_count) {
-        if (db_lock_record(fd, offset, sizeof(FeedbackRecord), LOCK_READ) == -1) {
-            break;
-        }
-        ssize_t bytes = read(fd, &current, sizeof(FeedbackRecord));
-        db_lock_record(fd, offset, sizeof(FeedbackRecord), LOCK_UNLOCK);
-
-        if (bytes != sizeof(FeedbackRecord)) break;
-
-        out_feedbacks[count++] = current;
-        offset += sizeof(FeedbackRecord);
+        db_lock_record(fd, offset, sizeof(f), LOCK_READ);
+        ssize_t n = read(fd, &f, sizeof(f));
+        db_lock_record(fd, offset, sizeof(f), LOCK_UNLOCK);
+        if (n != sizeof(f)) break;
+        out_fbs[count++] = f;
+        offset += sizeof(f);
     }
-
     close(fd);
     *out_count = count;
     return 0;
