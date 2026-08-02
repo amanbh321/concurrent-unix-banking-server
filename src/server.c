@@ -2,6 +2,7 @@
 #include "protocol.h"
 #include "db.h"
 #include "session.h"
+#include "customer_ops.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +47,7 @@ static void handle_signal(int sig) {
     exit(0);
 }
 
-// Opcode Handlers
+// Authentication Handlers
 static void handle_login(int client_fd, const RequestPacket *req, ResponsePacket *res) {
     UserRecord user;
     if (db_find_user_by_username(req->payload.login.username, &user) != 0) {
@@ -113,6 +114,15 @@ static void *handle_client(void *arg) {
                 break;
             case OP_LOGOUT:
                 handle_logout(client_fd, &res);
+                break;
+            case OP_VIEW_BALANCE:
+                handle_customer_view_balance(client_fd, &req, &res);
+                break;
+            case OP_DEPOSIT:
+                handle_customer_deposit(client_fd, &req, &res);
+                break;
+            case OP_WITHDRAW:
+                handle_customer_withdraw(client_fd, &req, &res);
                 break;
             case OP_EXIT:
                 session_remove_by_fd(client_fd);

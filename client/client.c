@@ -41,6 +41,113 @@ static const char* role_to_string(UserRole role) {
     }
 }
 
+static void show_customer_menu(int sock_fd, const UserRecord *user) {
+    int choice;
+    while (1) {
+        printf("===========================================\n");
+        printf("       CUSTOMER MENU - %s\n", user->full_name);
+        printf("===========================================\n");
+        printf("1. View Account Balance\n");
+        printf("2. Deposit Money\n");
+        printf("3. Withdraw Money\n");
+        printf("4. Logout\n");
+        printf("5. Exit System\n");
+        printf("Enter choice (1-5): ");
+        if (scanf("%d", &choice) != 1) {
+            while (getchar() != '\n');
+            continue;
+        }
+
+        if (choice == 1) {
+            RequestPacket req;
+            ResponsePacket res;
+            memset(&req, 0, sizeof(req));
+            req.opcode = OP_VIEW_BALANCE;
+            req.user_id = user->user_id;
+            req.role = user->role;
+
+            if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) break;
+            memset(&res, 0, sizeof(res));
+            if (read_bytes(sock_fd, &res, sizeof(res)) <= 0) break;
+
+            printf("\n[Server Response] %s\n", res.message);
+            if (res.status_code == STATUS_SUCCESS) {
+                printf("Account ID: %d | Status: ACTIVE | Current Balance: $%.2f\n", 
+                       res.payload.account.account_id, res.payload.account.balance);
+            }
+            printf("\n");
+        } else if (choice == 2) {
+            double amount;
+            printf("\nEnter Deposit Amount: $");
+            if (scanf("%lf", &amount) != 1) {
+                while (getchar() != '\n');
+                continue;
+            }
+
+            RequestPacket req;
+            ResponsePacket res;
+            memset(&req, 0, sizeof(req));
+            req.opcode = OP_DEPOSIT;
+            req.user_id = user->user_id;
+            req.role = user->role;
+            req.payload.deposit.amount = amount;
+
+            if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) break;
+            memset(&res, 0, sizeof(res));
+            if (read_bytes(sock_fd, &res, sizeof(res)) <= 0) break;
+
+            printf("\n[Server Response] %s\n\n", res.message);
+        } else if (choice == 3) {
+            double amount;
+            printf("\nEnter Withdrawal Amount: $");
+            if (scanf("%lf", &amount) != 1) {
+                while (getchar() != '\n');
+                continue;
+            }
+
+            RequestPacket req;
+            ResponsePacket res;
+            memset(&req, 0, sizeof(req));
+            req.opcode = OP_WITHDRAW;
+            req.user_id = user->user_id;
+            req.role = user->role;
+            req.payload.withdraw.amount = amount;
+
+            if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) break;
+            memset(&res, 0, sizeof(res));
+            if (read_bytes(sock_fd, &res, sizeof(res)) <= 0) break;
+
+            printf("\n[Server Response] %s\n\n", res.message);
+        } else if (choice == 4) {
+            RequestPacket req;
+            ResponsePacket res;
+            memset(&req, 0, sizeof(req));
+            req.opcode = OP_LOGOUT;
+            req.user_id = user->user_id;
+            req.role = user->role;
+
+            write_bytes(sock_fd, &req, sizeof(req));
+            read_bytes(sock_fd, &res, sizeof(res));
+            printf("\n[Server Response] %s\n\n", res.message);
+            break;
+        } else if (choice == 5) {
+            RequestPacket req;
+            ResponsePacket res;
+            memset(&req, 0, sizeof(req));
+            req.opcode = OP_EXIT;
+            req.user_id = user->user_id;
+            req.role = user->role;
+
+            write_bytes(sock_fd, &req, sizeof(req));
+            read_bytes(sock_fd, &res, sizeof(res));
+            printf("Server: %s\nDisconnecting...\n", res.message);
+            exit(0);
+        } else {
+            printf("Invalid choice. Try again.\n\n");
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     const char *server_ip = "127.0.0.1";
     int port = DEFAULT_PORT;
@@ -119,10 +226,17 @@ int main(int argc, char *argv[]) {
                 if (res.status_code == STATUS_SUCCESS) {
                     is_logged_in = 1;
                     current_user = res.payload.user;
-                    printf("Session active for User ID: %d | Role: %s\n", 
+                    printf("Session active for User ID: %d | Role: %s\n\n", 
                            current_user.user_id, role_to_string(current_user.role));
+
+                    if (current_user.role == ROLE_CUSTOMER) {
+                        show_customer_menu(sock_fd, &current_user);
+                        is_logged_in = 0;
+                        memset(&current_user, 0, sizeof(current_user));
+                    }
+                } else {
+                    printf("\n");
                 }
-                printf("\n");
             } else if (choice == 2) {
                 RequestPacket req;
                 ResponsePacket res;
@@ -136,6 +250,7 @@ int main(int argc, char *argv[]) {
                 printf("Invalid choice. Try again.\n\n");
             }
         } else {
+            // General logged-in view for other roles (Employee, Manager, Admin)
             printf("Logged in as: %s (ID: %d, Role: %s)\n", 
                    current_user.full_name, current_user.user_id, role_to_string(current_user.role));
             printf("-------------------------------------------\n");
@@ -155,10 +270,7 @@ int main(int argc, char *argv[]) {
                 req.user_id = current_user.user_id;
                 req.role = current_user.role;
 
-                if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) {
-                    printf("Server connection lost.\n");
-                    break;
-                }
+                if (write_bytes(sock_fd, &req, sizeof(req)) <= 0) break;
 
                 memset(&res, 0, sizeof(res));
                 read_bytes(sock_fd, &res, sizeof(res));

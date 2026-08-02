@@ -1,10 +1,10 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -pthread -Iinclude
 
-SERVER_OBJS = src/server.o src/db.o src/session.o
+SERVER_OBJS = src/server.o src/db.o src/session.o src/customer_ops.o
 DB_OBJS = src/db.o
 
-all: server client_app tests/test_db tests/test_session
+all: server client_app tests/test_db tests/test_session tests/test_customer
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -27,11 +27,15 @@ tests/test_db: tests/test_db.o $(DB_OBJS)
 tests/test_session: tests/test_session.o src/session.o
 	$(CC) $(CFLAGS) $^ -o $@
 
-test: tests/test_db tests/test_session
+tests/test_customer: tests/test_customer.o src/customer_ops.o $(DB_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@
+
+test: tests/test_db tests/test_session tests/test_customer
 	./tests/test_db
 	./tests/test_session
+	./tests/test_customer
 
 clean:
-	rm -f src/*.o client/*.o tests/*.o tests/test_db tests/test_session data/*.dat server client_app
+	rm -f src/*.o client/*.o tests/*.o tests/test_db tests/test_session tests/test_customer data/*.dat server client_app
 
 .PHONY: all test clean client_app server
