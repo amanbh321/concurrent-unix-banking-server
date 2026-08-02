@@ -3,6 +3,7 @@ server
 client_app
 tests/test_db
 tests/test_session
+tests/test_customer
 
 # Object Files
 *.o
